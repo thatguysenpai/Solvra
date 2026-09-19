@@ -1,0 +1,2531 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+app/
+  api/
+    chat/
+      route.ts
+    insights/
+      route.ts
+    journal/
+      route.ts
+    mood/
+      route.ts
+  components/
+    ChatApp.tsx
+    ChatHeader.tsx
+    ChatSection.tsx
+    Composer.tsx
+    CopyButton.tsx
+    EmptyState.tsx
+    InsightsSection.tsx
+    JournalSection.tsx
+    Markdown.tsx
+    Message.tsx
+    MessageList.tsx
+    MoodSection.tsx
+    Sidebar.tsx
+  favicon.ico
+  globals.css
+  icon.png
+  layout.tsx
+  page.tsx
+hooks/
+  useAppData.ts
+lib/
+  api.ts
+  brand.ts
+  groupConversations.ts
+  knowledgeBase.ts
+  storage.ts
+  types.ts
+public/
+  file.svg
+  globe.svg
+  next.svg
+  solvra-logo.png
+  vercel.svg
+  window.svg
+.gitignore
+eslint.config.mjs
+next.config.ts
+package.json
+postcss.config.mjs
+README.md
+setup-rag.ps1
+tailwind.config.js
+tsconfig.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/api/chat/route.ts">
+import { NextResponse } from 'next/server';
+import { retrieveRelevantChunks } from '@/lib/knowledgeBase';
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+const CRISIS_KEYWORDS = [
+  'suicide', 'kill myself', 'end my life', 'self harm', 'self-harm',
+  'hurt myself', 'want to die', "don't want to live",
+];
+
+function containsCrisisLanguage(text: string): boolean {
+  const lower = text.toLowerCase();
+  return CRISIS_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+const CRISIS_RESPONSE = `I hear that you're going through something really painful right now, and I want you to be safe. I'm not able to provide crisis support myself, but please reach out to people who can help right away:
+
+- If you're in immediate danger, contact your local emergency services.
+- In the US: call or text 988 (Suicide and Crisis Lifeline).
+- In Nigeria: the Mentally Aware Nigeria Initiative (MANI) helpline can help.
+
+Please also consider reaching out to someone you trust right now. You don't have to go through this alone.`;
+
+function buildSystemPrompt(context: { topic: string; text: string }[]): string {
+  const contextBlock = context.length
+    ? context.map((c, i) => `[${i + 1}] (${c.topic}) ${c.text}`).join('\n\n')
+    : 'No specific reference material matched this message.';
+
+  return `You are a warm, supportive mental health companion chatbot called SafeSpace. You are not a therapist and you never diagnose. You listen, validate feelings, and gently offer relevant, practical coping suggestions grounded ONLY in the reference material below when it is relevant. If the reference material doesn't clearly apply, just respond supportively without forcing it in. Keep responses concise (3-6 sentences), warm, and conversational â€” not clinical or listy unless the user asks for steps.
+
+Reference material:
+${contextBlock}`;
+}
+
+async function callGroq(userMessage: string, systemPrompt: string): Promise<string | null> {
+  if (!GROQ_API_KEY) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+
+    const res = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.7,
+        max_tokens: 400,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      console.error('Groq API error:', res.status, await res.text());
+      return null;
+    }
+
+    const data = await res.json();
+    return data?.choices?.[0]?.message?.content?.trim() || null;
+  } catch (err) {
+    console.error('Groq call failed:', err);
+    return null;
+  }
+}
+
+/** Fallback used when Groq is unreachable or no API key is set: still grounded in retrieval, just templated. */
+function buildFallbackResponse(userMessage: string, context: { topic: string; text: string }[]): string {
+  if (context.length === 0) {
+    return "I hear you. Thank you for sharing that with me â€” I'm here to listen. Could you tell me a bit more about what's on your mind?";
+  }
+  const top = context[0];
+  return `I hear you. That sounds like it relates to ${top.topic}. One thing that can help: ${top.text} Would you like to talk more about what's been going on?`;
+}
+
+export async function POST(request: Request) {
+  try {
+    const { message } = await request.json();
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return NextResponse.json({ error: 'Message is required' }, { status: 400 });
+    }
+
+    if (containsCrisisLanguage(message)) {
+      return NextResponse.json({ response: CRISIS_RESPONSE, usedLLM: false, sources: [] });
+    }
+
+    const relevantChunks = retrieveRelevantChunks(message, 3);
+    const systemPrompt = buildSystemPrompt(relevantChunks);
+
+    const llmResponse = await callGroq(message, systemPrompt);
+    const response = llmResponse || buildFallbackResponse(message, relevantChunks);
+
+    return NextResponse.json({
+      response,
+      usedLLM: llmResponse !== null,
+      sources: relevantChunks.map((c) => c.topic),
+    });
+  } catch (error) {
+    console.error('Chat API error:', error);
+    return NextResponse.json(
+      { error: 'Something went wrong processing your message.' },
+      { status: 500 }
+    );
+  }
+}
+</file>
+
+<file path="app/components/ChatApp.tsx">
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ChatMessage, Conversation } from '@/lib/types';
+import { loadConversations, saveConversations } from '@/lib/storage';
+import Sidebar from './Sidebar';
+import ChatHeader from './ChatHeader';
+import MessageList from './MessageList';
+import EmptyState from './EmptyState';
+import Composer from './Composer';
+
+const uid = () =>
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+/** Messages worth sending back to the model: skip failed turns and empty placeholders. */
+const toApiMessages = (messages: ChatMessage[]) =>
+  messages.filter((m) => !m.error && m.content.trim()).map(({ role, content }) => ({ role, content }));
+
+/** Client-only: reads localStorage during initial state, so it must never be server-rendered. */
+export default function ChatApp() {
+  const [conversations, setConversations] = useState<Conversation[]>(() => loadConversations());
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.matchMedia('(min-width: 768px)').matches);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const active = conversations.find((c) => c.id === activeId) ?? null;
+
+  // ── Persistence (debounced: streaming updates state on every chunk) ──────
+  useEffect(() => {
+    const t = setTimeout(() => saveConversations(conversations), 300);
+    return () => clearTimeout(t);
+  }, [conversations]);
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  const patchConversation = useCallback((id: string, fn: (c: Conversation) => Conversation) => {
+    setConversations((prev) => prev.map((c) => (c.id === id ? fn(c) : c)));
+  }, []);
+
+  const closeSidebarOnMobile = () => {
+    if (!window.matchMedia('(min-width: 768px)').matches) setSidebarOpen(false);
+  };
+
+  // ── Streaming ────────────────────────────────────────────────────────────
+  /** Appends an empty assistant message to `convId` and streams the reply into it. */
+  const streamReply = useCallback(
+    async (convId: string, history: ChatMessage[]) => {
+      const assistantId = uid();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setIsStreaming(true);
+
+      const setAssistant = (fn: (m: ChatMessage) => ChatMessage) =>
+        patchConversation(convId, (c) => ({
+          ...c,
+          messages: c.messages.map((m) => (m.id === assistantId ? fn(m) : m)),
+        }));
+
+      patchConversation(convId, (c) => ({
+        ...c,
+        messages: [...history, { id: assistantId, role: 'assistant', content: '' }],
+      }));
+
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: toApiMessages(history) }),
+          signal: controller.signal,
+        });
+
+        if (!res.ok || !res.body) {
+          let message = `Request failed (${res.status}).`;
+          try {
+            const data = await res.json();
+            if (data?.error) message = data.details ? `${data.error} — ${data.details}` : data.error;
+          } catch {
+            /* non-JSON error body */
+          }
+          throw new Error(message);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          if (chunk) setAssistant((m) => ({ ...m, content: m.content + chunk }));
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          // User pressed Stop: keep whatever streamed so far.
+        } else {
+          const message = err instanceof Error ? err.message : 'Something went wrong.';
+          setAssistant((m) => ({ ...m, content: message, error: true }));
+        }
+      } finally {
+        // Drop the placeholder if nothing ever arrived (e.g. stopped immediately).
+        patchConversation(convId, (c) => ({
+          ...c,
+          messages: c.messages.filter((m) => !(m.id === assistantId && m.content === '')),
+        }));
+        if (abortRef.current === controller) abortRef.current = null;
+        setIsStreaming(false);
+      }
+    },
+    [patchConversation],
+  );
+
+  const handleSend = useCallback(
+    (text: string) => {
+      const content = text.trim();
+      if (!content || isStreaming) return;
+
+      const userMsg: ChatMessage = { id: uid(), role: 'user', content };
+      let convId = activeId;
+      let history: ChatMessage[];
+
+      if (active) {
+        history = [...active.messages, userMsg];
+        patchConversation(active.id, (c) => ({ ...c, messages: history }));
+      } else {
+        convId = uid();
+        history = [userMsg];
+        const created: Conversation = {
+          id: convId,
+          title: content.slice(0, 40),
+          messages: history,
+          createdAt: Date.now(),
+        };
+        setConversations((prev) => [created, ...prev]);
+        setActiveId(convId);
+      }
+
+      void streamReply(convId!, history);
+    },
+    [active, activeId, isStreaming, patchConversation, streamReply],
+  );
+
+  const handleRegenerate = useCallback(() => {
+    if (!active || isStreaming) return;
+    const last = active.messages[active.messages.length - 1];
+    if (last?.role !== 'assistant') return;
+    void streamReply(active.id, active.messages.slice(0, -1));
+  }, [active, isStreaming, streamReply]);
+
+  const handleStop = () => abortRef.current?.abort();
+
+  // ── Conversation management ──────────────────────────────────────────────
+  const handleNew = useCallback(() => {
+    abortRef.current?.abort();
+    setActiveId(null);
+    closeSidebarOnMobile();
+  }, []);
+
+  const handleSelect = (id: string) => {
+    if (id === activeId) return closeSidebarOnMobile();
+    abortRef.current?.abort();
+    setActiveId(id);
+    closeSidebarOnMobile();
+  };
+
+  const handleDelete = (id: string) => {
+    if (id === activeId) {
+      abortRef.current?.abort();
+      setActiveId(null);
+    }
+    setConversations((prev) => prev.filter((c) => c.id !== id));
+  };
+
+  // ⌘K / Ctrl+K → new chat
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        handleNew();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [handleNew]);
+
+  // ── Render ───────────────────────────────────────────────────────────────
+  return (
+    <div className="flex h-full overflow-hidden bg-paper">
+      <Sidebar
+        conversations={conversations}
+        activeId={activeId}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        onNew={handleNew}
+        onSelect={handleSelect}
+        onDelete={handleDelete}
+      />
+
+      <main className="flex h-full min-w-0 flex-1 flex-col">
+        <ChatHeader title={active?.title} sidebarOpen={sidebarOpen} onOpenSidebar={() => setSidebarOpen(true)} />
+
+        {active && active.messages.length > 0 ? (
+          <MessageList
+            key={active.id}
+            messages={active.messages}
+            isStreaming={isStreaming}
+            onRegenerate={handleRegenerate}
+          />
+        ) : (
+          <EmptyState onPick={handleSend} />
+        )}
+
+        <Composer isStreaming={isStreaming} onSend={handleSend} onStop={handleStop} focusKey={activeId} />
+      </main>
+    </div>
+  );
+}
+</file>
+
+<file path="app/components/ChatHeader.tsx">
+'use client';
+
+import { Menu } from 'lucide-react';
+import { APP_NAME } from '@/lib/brand';
+
+interface Props {
+  title?: string;
+  sidebarOpen: boolean;
+  onOpenSidebar: () => void;
+}
+
+export default function ChatHeader({ title, sidebarOpen, onOpenSidebar }: Props) {
+  return (
+    <header className="z-20 flex h-13 shrink-0 items-center gap-3 border-b border-line bg-paper/90 px-5 backdrop-blur-xs">
+      {!sidebarOpen && (
+        <button
+          type="button"
+          onClick={onOpenSidebar}
+          title="Open sidebar"
+          aria-label="Open sidebar"
+          className="-ml-1 rounded-lg p-1.5 text-ink-soft transition-colors hover:bg-hover hover:text-ink"
+        >
+          <Menu size={19} />
+        </button>
+      )}
+      <div className="flex items-center gap-1.5 text-xs font-semibold">
+        <span className="h-2 w-2 rounded-full bg-brand" />
+        {APP_NAME}
+      </div>
+      {title && (
+        <>
+          <div className="hidden h-4 w-px bg-[#e2ded6] sm:block" />
+          <span className="hidden max-w-md truncate text-xs text-[#8c867b] sm:inline">{title}</span>
+        </>
+      )}
+    </header>
+  );
+}
+</file>
+
+<file path="app/components/Composer.tsx">
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import { ArrowUp, Square } from 'lucide-react';
+import { APP_NAME } from '@/lib/brand';
+
+interface Props {
+  isStreaming: boolean;
+  onSend: (text: string) => void;
+  onStop: () => void;
+  /** Change this value to pull focus back into the input (e.g. on chat switch). */
+  focusKey?: string | null;
+}
+
+export default function Composer({ isStreaming, onSend, onStop, focusKey }: Props) {
+  const [value, setValue] = useState('');
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    // Don't pop the on-screen keyboard on touch devices.
+    if (window.matchMedia('(pointer: fine)').matches) ref.current?.focus();
+  }, [focusKey]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  }, [value]);
+
+  const canSend = value.trim().length > 0 && !isStreaming;
+
+  const submit = () => {
+    if (!canSend) return;
+    onSend(value.trim());
+    setValue('');
+  };
+
+  return (
+    <div className="shrink-0 bg-gradient-to-t from-paper via-paper/90 to-transparent px-4 pb-5 pt-2 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-3xl">
+        <div className="rounded-2xl border border-line-strong bg-card p-3 shadow-[0_2px_12px_rgba(0,0,0,0.04)] transition-all duration-150 focus-within:border-accent focus-within:ring-1 focus-within:ring-accent/30">
+          <textarea
+            ref={ref}
+            rows={2}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                submit();
+              }
+            }}
+            placeholder={`Reply to ${APP_NAME}…`}
+            aria-label="Message"
+            className="block w-full resize-none border-0 bg-transparent p-1.5 text-[15px] leading-relaxed text-ink placeholder-ink-muted focus:outline-none"
+          />
+          <div className="mt-1 flex items-center justify-between border-t border-[#f0ece4] pt-2 text-xs">
+            <div className="flex items-center gap-1.5 rounded-md border border-line bg-paper px-2 py-1 text-[11px] font-medium text-ink-soft">
+              <span className="h-1.5 w-1.5 rounded-full bg-brand" />
+              {APP_NAME}
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="hidden font-mono text-[11px] text-ink-muted sm:inline">
+                Enter to send · Shift+Enter for newline
+              </span>
+              {isStreaming ? (
+                <button
+                  type="button"
+                  onClick={onStop}
+                  title="Stop generating"
+                  aria-label="Stop generating"
+                  className="flex h-8 w-8 items-center justify-center rounded-xl border border-line-strong bg-card text-ink transition-colors hover:bg-hover"
+                >
+                  <Square size={13} fill="currentColor" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={submit}
+                  disabled={!canSend}
+                  title="Send"
+                  aria-label="Send message"
+                  className="flex h-8 w-8 items-center justify-center rounded-xl bg-accent text-white transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:bg-[#e6c9bd]"
+                >
+                  <ArrowUp size={17} />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+        <p className="mt-2 text-center text-[11px] text-[#a6a095]">
+          {APP_NAME} can make mistakes. Please verify important information.
+        </p>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="app/components/CopyButton.tsx">
+'use client';
+
+import { useState } from 'react';
+import { Check, Copy } from 'lucide-react';
+
+interface Props {
+  text: string;
+  className?: string;
+  title?: string;
+}
+
+export default function CopyButton({ text, className = '', title = 'Copy' }: Props) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      /* clipboard unavailable (insecure context) — ignore */
+    }
+  };
+
+  return (
+    <button type="button" onClick={copy} title={copied ? 'Copied' : title} aria-label={title} className={className}>
+      {copied ? <Check size={15} className="text-[#3b7a57]" /> : <Copy size={15} />}
+    </button>
+  );
+}
+</file>
+
+<file path="app/components/EmptyState.tsx">
+'use client';
+
+import Image from 'next/image';
+import { APP_NAME } from '@/lib/brand';
+
+const STARTERS = [
+  { verb: 'Explain', prompt: 'Explain how HTTP caching works, with a concrete example.' },
+  { verb: 'Draft', prompt: 'Draft a concise, friendly email asking a client for project feedback.' },
+  { verb: 'Debug', prompt: 'Help me debug a React component that re-renders too often.' },
+  { verb: 'Plan', prompt: 'Plan a 4-week study schedule for learning the basics of machine learning.' },
+];
+
+export default function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 py-10">
+      <div className="m-auto flex w-full flex-col items-center">
+      <Image
+        src="/solvra-logo.png"
+        alt=""
+        width={56}
+        height={56}
+        priority
+        className="h-14 w-14 rounded-xl border border-line-strong object-cover"
+      />
+      <h1 className="mt-6 text-center font-display text-4xl text-[#1a1917] sm:text-5xl">How can I help?</h1>
+      <p className="mt-2 text-center text-sm text-ink-soft">Ask anything. {APP_NAME} answers in plain, dense prose.</p>
+
+      <div className="mt-10 grid w-full max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
+        {STARTERS.map((s) => (
+          <button
+            key={s.verb}
+            type="button"
+            onClick={() => onPick(s.prompt)}
+            className="group rounded-xl border border-line bg-card p-3.5 text-left transition-colors hover:border-accent/50"
+          >
+            <div className="font-mono text-[11px] font-semibold uppercase tracking-wider text-accent">{s.verb}</div>
+            <div className="mt-1 text-[13px] leading-snug text-ink-soft group-hover:text-ink">{s.prompt}</div>
+          </button>
+        ))}
+      </div>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="app/components/Markdown.tsx">
+'use client';
+
+import { Children, isValidElement, memo, type ReactElement, type ReactNode } from 'react';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import CopyButton from './CopyButton';
+
+function CodeBlock({ language, code }: { language?: string; code: string }) {
+  return (
+    <div className="overflow-hidden rounded-xl border border-[#3a3632] bg-code text-[#e7e5e4]">
+      <div className="flex items-center justify-between border-b border-[#34302c] px-3.5 py-1.5">
+        <span className="font-mono text-[11px] uppercase tracking-wider text-[#a8a29e]">{language || 'text'}</span>
+        <CopyButton
+          text={code}
+          title="Copy code"
+          className="rounded-md p-1 text-[#a8a29e] transition-colors hover:bg-white/10 hover:text-white"
+        />
+      </div>
+      <pre className="overflow-x-auto p-3.5 font-mono text-[13px] leading-relaxed">
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
+}
+
+const components: Components = {
+  pre({ children }) {
+    // react-markdown renders fenced blocks as <pre><code class="language-x">…</code></pre>
+    const child = Children.toArray(children)[0];
+    if (isValidElement(child)) {
+      const el = child as ReactElement<{ className?: string; children?: ReactNode }>;
+      const language = /language-([\w-]+)/.exec(el.props.className ?? '')?.[1];
+      const code = String(el.props.children ?? '').replace(/\n$/, '');
+      return <CodeBlock language={language} code={code} />;
+    }
+    return <pre>{children}</pre>;
+  },
+  table({ children }) {
+    return (
+      <div className="overflow-x-auto rounded-xl border border-line bg-card">
+        <table>{children}</table>
+      </div>
+    );
+  },
+  a({ href, children }) {
+    return (
+      <a href={href} target="_blank" rel="noopener noreferrer">
+        {children}
+      </a>
+    );
+  },
+};
+
+function Markdown({ content }: { content: string }) {
+  return (
+    <div className="md">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+export default memo(Markdown);
+</file>
+
+<file path="app/components/Message.tsx">
+'use client';
+
+import { memo } from 'react';
+import Image from 'next/image';
+import { RefreshCw, User } from 'lucide-react';
+import type { ChatMessage } from '@/lib/types';
+import { APP_NAME } from '@/lib/brand';
+import CopyButton from './CopyButton';
+import Markdown from './Markdown';
+
+interface Props {
+  message: ChatMessage;
+  /** This assistant message is the one currently being streamed. */
+  streaming?: boolean;
+  /** Show the regenerate action (last assistant message, nothing streaming). */
+  canRegenerate?: boolean;
+  onRegenerate?: () => void;
+}
+
+function Thinking() {
+  return (
+    <div className="flex items-center gap-1.5 py-2" role="status" aria-label={`${APP_NAME} is thinking`}>
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="h-1.5 w-1.5 animate-dot rounded-full bg-accent"
+          style={{ animationDelay: `${i * 160}ms` }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function MessageView({ message, streaming, canRegenerate, onRegenerate }: Props) {
+  if (message.role === 'user') {
+    return (
+      <div className="flex items-start gap-4">
+        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-line-strong bg-[#e4dfd5] text-[#524e47]">
+          <User size={16} />
+        </div>
+        <div className="min-w-0 flex-1 space-y-1 pt-1">
+          <div className="text-xs font-medium text-[#8c867b]">You</div>
+          <div className="whitespace-pre-wrap rounded-2xl border border-line bg-white/70 p-4 text-[15px] leading-relaxed shadow-[0_1px_2px_rgba(0,0,0,0.03)] [overflow-wrap:anywhere]">
+            {message.content}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const showThinking = streaming && message.content === '';
+
+  return (
+    <div className="flex items-start gap-4">
+      <Image
+        src="/solvra-logo.png"
+        alt={APP_NAME}
+        width={32}
+        height={32}
+        className="mt-0.5 h-8 w-8 shrink-0 rounded-md border border-line-strong object-cover"
+      />
+      <div className="min-w-0 flex-1 pt-1">
+        <div className="mb-1 flex h-6 items-center justify-between">
+          <div className="text-xs font-semibold">{APP_NAME}</div>
+          {!streaming && message.content && (
+            <div className="flex items-center gap-0.5 text-[#8c867b]">
+              {!message.error && (
+                <CopyButton
+                  text={message.content}
+                  title="Copy response"
+                  className="rounded p-1 transition-colors hover:bg-hover hover:text-ink"
+                />
+              )}
+              {canRegenerate && (
+                <button
+                  type="button"
+                  onClick={onRegenerate}
+                  title="Regenerate"
+                  aria-label="Regenerate response"
+                  className="rounded p-1 transition-colors hover:bg-hover hover:text-ink"
+                >
+                  <RefreshCw size={15} />
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+        {showThinking ? (
+          <Thinking />
+        ) : message.error ? (
+          <p className="rounded-xl border border-[#f3d7cc] bg-accent-tint px-4 py-3 text-sm text-[#883624]">
+            {message.content}
+          </p>
+        ) : (
+          <Markdown content={message.content} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default memo(MessageView);
+</file>
+
+<file path="app/components/MessageList.tsx">
+'use client';
+
+import { useEffect, useRef } from 'react';
+import type { ChatMessage } from '@/lib/types';
+import Message from './Message';
+
+interface Props {
+  messages: ChatMessage[];
+  isStreaming: boolean;
+  onRegenerate: () => void;
+}
+
+/** Scrolls to the bottom as tokens arrive, unless the reader has scrolled up. */
+export default function MessageList({ messages, isStreaming, onRegenerate }: Props) {
+  const scroller = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+  const prevLength = useRef(0);
+
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    if (messages.length > prevLength.current) stick.current = true; // new turn → follow it
+    prevLength.current = messages.length;
+    if (stick.current) el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  const onScroll = () => {
+    const el = scroller.current;
+    if (!el) return;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+
+  const lastIndex = messages.length - 1;
+
+  return (
+    <div ref={scroller} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-8 sm:px-6 lg:px-8">
+      <div className="mx-auto w-full max-w-3xl space-y-8 pb-6">
+        {messages.map((m, i) => (
+          <Message
+            key={m.id}
+            message={m}
+            streaming={isStreaming && i === lastIndex && m.role === 'assistant'}
+            canRegenerate={!isStreaming && i === lastIndex && m.role === 'assistant'}
+            onRegenerate={onRegenerate}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="lib/brand.ts">
+/** Single source for the product name shown in the UI. */
+export const APP_NAME = 'Solvra';
+</file>
+
+<file path="lib/groupConversations.ts">
+import type { Conversation } from './types';
+
+export interface ConversationGroup {
+  label: string;
+  items: Conversation[];
+}
+
+const DAY = 24 * 60 * 60 * 1000;
+
+/** Buckets conversations (newest first) into Today / Yesterday / Previous 7 Days / Older. */
+export function groupConversations(conversations: Conversation[], now = Date.now()): ConversationGroup[] {
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
+  const today = startOfToday.getTime();
+
+  const buckets: ConversationGroup[] = [
+    { label: 'Today', items: [] },
+    { label: 'Yesterday', items: [] },
+    { label: 'Previous 7 Days', items: [] },
+    { label: 'Older', items: [] },
+  ];
+
+  const sorted = [...conversations].sort((a, b) => b.createdAt - a.createdAt);
+  for (const c of sorted) {
+    if (c.createdAt >= today) buckets[0].items.push(c);
+    else if (c.createdAt >= today - DAY) buckets[1].items.push(c);
+    else if (c.createdAt >= today - 7 * DAY) buckets[2].items.push(c);
+    else buckets[3].items.push(c);
+  }
+  return buckets.filter((b) => b.items.length > 0);
+}
+</file>
+
+<file path="lib/knowledgeBase.ts">
+// Small local knowledge base for the RAG chatbot.
+// Each entry is a short, self-contained chunk so retrieval stays precise.
+// This is general supportive/psychoeducational content, not medical advice.
+
+export interface KBChunk {
+  id: string;
+  topic: string;
+  text: string;
+}
+
+export const knowledgeBase: KBChunk[] = [
+  {
+    id: 'anxiety-grounding',
+    topic: 'anxiety, panic, overwhelm',
+    text: 'When anxiety feels overwhelming, grounding techniques can help bring attention back to the present moment. One common method is the 5-4-3-2-1 technique: name 5 things you can see, 4 things you can touch, 3 things you can hear, 2 things you can smell, and 1 thing you can taste. Slow, deep breathing (inhale for 4 counts, hold for 4, exhale for 6) can also calm the nervous system.',
+  },
+  {
+    id: 'stress-breathing',
+    topic: 'stress, tension, racing thoughts',
+    text: 'Box breathing is a simple technique for reducing stress: breathe in for 4 seconds, hold for 4 seconds, breathe out for 4 seconds, hold for 4 seconds, and repeat. Regular short breaks, stepping away from a stressful task for even five minutes, and stretching can also lower physical tension.',
+  },
+  {
+    id: 'sleep-hygiene',
+    topic: 'sleep, insomnia, tiredness',
+    text: 'Good sleep habits include keeping a consistent sleep and wake time, avoiding screens for 30-60 minutes before bed, keeping the room cool and dark, and avoiding caffeine in the afternoon and evening. If racing thoughts keep you up, writing them down in a notebook before bed can help offload them.',
+  },
+  {
+    id: 'low-mood-behavioral-activation',
+    topic: 'low mood, sadness, depression, lack of motivation',
+    text: 'When mood is low, motivation often follows action rather than preceding it. Behavioral activation means choosing one small, achievable activity, even something as simple as a short walk, tidying one corner of a room, or messaging a friend, rather than waiting to feel motivated first. Small consistent steps tend to help more than big ambitious plans.',
+  },
+  {
+    id: 'journaling-benefits',
+    topic: 'journaling, reflection, processing emotions',
+    text: 'Writing about thoughts and feelings, even briefly, can help process difficult emotions and identify patterns over time. It can help to note not just what happened, but what you felt and what you needed in that moment. There is no right way to journal; short, honest entries are often more useful than long, polished ones.',
+  },
+  {
+    id: 'negative-thought-patterns',
+    topic: 'negative thoughts, self-criticism, cognitive distortions',
+    text: 'Common unhelpful thinking patterns include catastrophizing (assuming the worst outcome), all-or-nothing thinking (seeing things as entirely good or bad), and mind reading (assuming you know what others think of you). Noticing when a thought fits one of these patterns, and asking "what evidence do I actually have for this?", can create some distance from it.',
+  },
+  {
+    id: 'social-connection',
+    topic: 'loneliness, isolation, relationships',
+    text: 'Loneliness can worsen low mood and anxiety, and reaching out, even a short message to one person, can help break the cycle. It is common to feel like a burden when considering reaching out; most people are more receptive to being contacted than we predict they will be.',
+  },
+  {
+    id: 'crisis-resources',
+    topic: 'crisis, suicidal thoughts, self-harm, emergency',
+    text: 'If someone is in crisis or having thoughts of suicide or self-harm, this is urgent and professional or emergency support should be sought immediately rather than relying on self-help techniques. In the US, the 988 Suicide and Crisis Lifeline can be reached by calling or texting 988. In Nigeria, resources include the Mentally Aware Nigeria Initiative (MANI) helpline. If there is immediate danger, local emergency services should be contacted.',
+  },
+  {
+    id: 'academic-stress',
+    topic: 'academic pressure, exams, deadlines, school stress',
+    text: 'Academic stress often builds when tasks feel large and undefined. Breaking work into small, specific, time-boxed chunks (e.g. "outline section 1 for 25 minutes") rather than vague goals ("study for exam") reduces the sense of overwhelm and makes starting easier. Regular short breaks (e.g. the Pomodoro technique) also help sustain focus over long study sessions.',
+  },
+  {
+    id: 'self-compassion',
+    topic: 'self-criticism, guilt, shame, self-compassion',
+    text: 'Self-compassion involves treating yourself with the same kindness you would offer a friend in the same situation, rather than harsh self-criticism. Research suggests self-compassion is associated with greater resilience and motivation than self-criticism, despite the common belief that being hard on oneself is necessary to improve.',
+  },
+  {
+    id: 'anger-management',
+    topic: 'anger, frustration, irritability',
+    text: 'When anger rises, it often helps to create space before reacting: stepping away from the situation for a few minutes, slowing the breath, and naming the emotion internally ("I am feeling angry right now") can reduce the intensity of the reaction. Physical activity, like a brisk walk, can also help discharge the physiological arousal that comes with anger.',
+  },
+  {
+    id: 'burnout',
+    topic: 'burnout, exhaustion, overwork',
+    text: 'Burnout typically develops from prolonged stress without adequate recovery, and shows up as emotional exhaustion, cynicism, and reduced sense of accomplishment. Recovery usually requires actually reducing load where possible, protecting rest and sleep, and reconnecting with activities that feel meaningful rather than just obligatory.',
+  },
+];
+
+/** Very small tokenizer: lowercase, strip punctuation, split on whitespace. */
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+}
+
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'your', 'with', 'this',
+  'that', 'have', 'has', 'was', 'were', 'can', 'could', 'should', 'would',
+  'about', 'from', 'into', 'over', 'when', 'what', 'how', 'why', 'feel',
+  'feeling', 'like', 'just', 'really', 'been', 'being', 'they', 'them',
+]);
+
+interface ScoredChunk extends KBChunk {
+  score: number;
+}
+
+/**
+ * Extremely simple retrieval: TF overlap between the query and each chunk
+ * (topic + text), weighted slightly toward topic matches. No embeddings,
+ * no vector DB â€” good enough for a small fixed corpus like this one.
+ */
+export function retrieveRelevantChunks(query: string, topK = 3): ScoredChunk[] {
+  const queryTokens = tokenize(query).filter((t) => !STOPWORDS.has(t));
+  if (queryTokens.length === 0) return [];
+
+  const scored: ScoredChunk[] = knowledgeBase.map((chunk) => {
+    const topicTokens = tokenize(chunk.topic);
+    const textTokens = tokenize(chunk.text);
+
+    let score = 0;
+    for (const qt of queryTokens) {
+      if (topicTokens.includes(qt)) score += 2;
+      if (textTokens.includes(qt)) score += 1;
+    }
+
+    return { ...chunk, score };
+  });
+
+  return scored
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+}
+</file>
+
+<file path="lib/storage.ts">
+import type { Conversation } from './types';
+
+const KEY = 'chatbot_conversations';
+
+export function loadConversations(): Conversation[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as Conversation[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveConversations(conversations: Conversation[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(KEY, JSON.stringify(conversations));
+  } catch {
+    // Quota exceeded or storage disabled — chat still works, just not persisted.
+  }
+}
+</file>
+
+<file path="setup-rag.ps1">
+# Run this from D:\ITACHI\safespace_ai
+# Creates/overwrites the 4 files needed for the RAG chatbot.
+
+New-Item -ItemType Directory -Force -Path ".\app\api\chat" | Out-Null
+
+@'
+// Small local knowledge base for the RAG chatbot.
+// Each entry is a short, self-contained chunk so retrieval stays precise.
+// This is general supportive/psychoeducational content, not medical advice.
+
+export interface KBChunk {
+  id: string;
+  topic: string;
+  text: string;
+}
+
+export const knowledgeBase: KBChunk[] = [
+  {
+    id: 'anxiety-grounding',
+    topic: 'anxiety, panic, overwhelm',
+    text: 'When anxiety feels overwhelming, grounding techniques can help bring attention back to the present moment. One common method is the 5-4-3-2-1 technique: name 5 things you can see, 4 things you can touch, 3 things you can hear, 2 things you can smell, and 1 thing you can taste. Slow, deep breathing (inhale for 4 counts, hold for 4, exhale for 6) can also calm the nervous system.',
+  },
+  {
+    id: 'stress-breathing',
+    topic: 'stress, tension, racing thoughts',
+    text: 'Box breathing is a simple technique for reducing stress: breathe in for 4 seconds, hold for 4 seconds, breathe out for 4 seconds, hold for 4 seconds, and repeat. Regular short breaks, stepping away from a stressful task for even five minutes, and stretching can also lower physical tension.',
+  },
+  {
+    id: 'sleep-hygiene',
+    topic: 'sleep, insomnia, tiredness',
+    text: 'Good sleep habits include keeping a consistent sleep and wake time, avoiding screens for 30-60 minutes before bed, keeping the room cool and dark, and avoiding caffeine in the afternoon and evening. If racing thoughts keep you up, writing them down in a notebook before bed can help offload them.',
+  },
+  {
+    id: 'low-mood-behavioral-activation',
+    topic: 'low mood, sadness, depression, lack of motivation',
+    text: 'When mood is low, motivation often follows action rather than preceding it. Behavioral activation means choosing one small, achievable activity, even something as simple as a short walk, tidying one corner of a room, or messaging a friend, rather than waiting to feel motivated first. Small consistent steps tend to help more than big ambitious plans.',
+  },
+  {
+    id: 'journaling-benefits',
+    topic: 'journaling, reflection, processing emotions',
+    text: 'Writing about thoughts and feelings, even briefly, can help process difficult emotions and identify patterns over time. It can help to note not just what happened, but what you felt and what you needed in that moment. There is no right way to journal; short, honest entries are often more useful than long, polished ones.',
+  },
+  {
+    id: 'negative-thought-patterns',
+    topic: 'negative thoughts, self-criticism, cognitive distortions',
+    text: 'Common unhelpful thinking patterns include catastrophizing (assuming the worst outcome), all-or-nothing thinking (seeing things as entirely good or bad), and mind reading (assuming you know what others think of you). Noticing when a thought fits one of these patterns, and asking "what evidence do I actually have for this?", can create some distance from it.',
+  },
+  {
+    id: 'social-connection',
+    topic: 'loneliness, isolation, relationships',
+    text: 'Loneliness can worsen low mood and anxiety, and reaching out, even a short message to one person, can help break the cycle. It is common to feel like a burden when considering reaching out; most people are more receptive to being contacted than we predict they will be.',
+  },
+  {
+    id: 'crisis-resources',
+    topic: 'crisis, suicidal thoughts, self-harm, emergency',
+    text: 'If someone is in crisis or having thoughts of suicide or self-harm, this is urgent and professional or emergency support should be sought immediately rather than relying on self-help techniques. In the US, the 988 Suicide and Crisis Lifeline can be reached by calling or texting 988. In Nigeria, resources include the Mentally Aware Nigeria Initiative (MANI) helpline. If there is immediate danger, local emergency services should be contacted.',
+  },
+  {
+    id: 'academic-stress',
+    topic: 'academic pressure, exams, deadlines, school stress',
+    text: 'Academic stress often builds when tasks feel large and undefined. Breaking work into small, specific, time-boxed chunks (e.g. "outline section 1 for 25 minutes") rather than vague goals ("study for exam") reduces the sense of overwhelm and makes starting easier. Regular short breaks (e.g. the Pomodoro technique) also help sustain focus over long study sessions.',
+  },
+  {
+    id: 'self-compassion',
+    topic: 'self-criticism, guilt, shame, self-compassion',
+    text: 'Self-compassion involves treating yourself with the same kindness you would offer a friend in the same situation, rather than harsh self-criticism. Research suggests self-compassion is associated with greater resilience and motivation than self-criticism, despite the common belief that being hard on oneself is necessary to improve.',
+  },
+  {
+    id: 'anger-management',
+    topic: 'anger, frustration, irritability',
+    text: 'When anger rises, it often helps to create space before reacting: stepping away from the situation for a few minutes, slowing the breath, and naming the emotion internally ("I am feeling angry right now") can reduce the intensity of the reaction. Physical activity, like a brisk walk, can also help discharge the physiological arousal that comes with anger.',
+  },
+  {
+    id: 'burnout',
+    topic: 'burnout, exhaustion, overwork',
+    text: 'Burnout typically develops from prolonged stress without adequate recovery, and shows up as emotional exhaustion, cynicism, and reduced sense of accomplishment. Recovery usually requires actually reducing load where possible, protecting rest and sleep, and reconnecting with activities that feel meaningful rather than just obligatory.',
+  },
+];
+
+/** Very small tokenizer: lowercase, strip punctuation, split on whitespace. */
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+}
+
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'your', 'with', 'this',
+  'that', 'have', 'has', 'was', 'were', 'can', 'could', 'should', 'would',
+  'about', 'from', 'into', 'over', 'when', 'what', 'how', 'why', 'feel',
+  'feeling', 'like', 'just', 'really', 'been', 'being', 'they', 'them',
+]);
+
+interface ScoredChunk extends KBChunk {
+  score: number;
+}
+
+/**
+ * Extremely simple retrieval: TF overlap between the query and each chunk
+ * (topic + text), weighted slightly toward topic matches. No embeddings,
+ * no vector DB — good enough for a small fixed corpus like this one.
+ */
+export function retrieveRelevantChunks(query: string, topK = 3): ScoredChunk[] {
+  const queryTokens = tokenize(query).filter((t) => !STOPWORDS.has(t));
+  if (queryTokens.length === 0) return [];
+
+  const scored: ScoredChunk[] = knowledgeBase.map((chunk) => {
+    const topicTokens = tokenize(chunk.topic);
+    const textTokens = tokenize(chunk.text);
+
+    let score = 0;
+    for (const qt of queryTokens) {
+      if (topicTokens.includes(qt)) score += 2;
+      if (textTokens.includes(qt)) score += 1;
+    }
+
+    return { ...chunk, score };
+  });
+
+  return scored
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+}
+'@ | Set-Content -Path ".\lib\knowledgeBase.ts" -Encoding utf8
+
+@'
+import { NextResponse } from 'next/server';
+import { retrieveRelevantChunks } from '@/lib/knowledgeBase';
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+const CRISIS_KEYWORDS = [
+  'suicide', 'kill myself', 'end my life', 'self harm', 'self-harm',
+  'hurt myself', 'want to die', "don't want to live",
+];
+
+function containsCrisisLanguage(text: string): boolean {
+  const lower = text.toLowerCase();
+  return CRISIS_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+const CRISIS_RESPONSE = `I hear that you're going through something really painful right now, and I want you to be safe. I'm not able to provide crisis support myself, but please reach out to people who can help right away:
+
+- If you're in immediate danger, contact your local emergency services.
+- In the US: call or text 988 (Suicide and Crisis Lifeline).
+- In Nigeria: the Mentally Aware Nigeria Initiative (MANI) helpline can help.
+
+Please also consider reaching out to someone you trust right now. You don't have to go through this alone.`;
+
+function buildSystemPrompt(context: { topic: string; text: string }[]): string {
+  const contextBlock = context.length
+    ? context.map((c, i) => `[${i + 1}] (${c.topic}) ${c.text}`).join('\n\n')
+    : 'No specific reference material matched this message.';
+
+  return `You are a warm, supportive mental health companion chatbot called SafeSpace. You are not a therapist and you never diagnose. You listen, validate feelings, and gently offer relevant, practical coping suggestions grounded ONLY in the reference material below when it is relevant. If the reference material doesn't clearly apply, just respond supportively without forcing it in. Keep responses concise (3-6 sentences), warm, and conversational — not clinical or listy unless the user asks for steps.
+
+Reference material:
+${contextBlock}`;
+}
+
+async function callGroq(userMessage: string, systemPrompt: string): Promise<string | null> {
+  if (!GROQ_API_KEY) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+
+    const res = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.7,
+        max_tokens: 400,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      console.error('Groq API error:', res.status, await res.text());
+      return null;
+    }
+
+    const data = await res.json();
+    return data?.choices?.[0]?.message?.content?.trim() || null;
+  } catch (err) {
+    console.error('Groq call failed:', err);
+    return null;
+  }
+}
+
+/** Fallback used when Groq is unreachable or no API key is set: still grounded in retrieval, just templated. */
+function buildFallbackResponse(userMessage: string, context: { topic: string; text: string }[]): string {
+  if (context.length === 0) {
+    return "I hear you. Thank you for sharing that with me — I'm here to listen. Could you tell me a bit more about what's on your mind?";
+  }
+  const top = context[0];
+  return `I hear you. That sounds like it relates to ${top.topic}. One thing that can help: ${top.text} Would you like to talk more about what's been going on?`;
+}
+
+export async function POST(request: Request) {
+  try {
+    const { message } = await request.json();
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return NextResponse.json({ error: 'Message is required' }, { status: 400 });
+    }
+
+    if (containsCrisisLanguage(message)) {
+      return NextResponse.json({ response: CRISIS_RESPONSE, usedLLM: false, sources: [] });
+    }
+
+    const relevantChunks = retrieveRelevantChunks(message, 3);
+    const systemPrompt = buildSystemPrompt(relevantChunks);
+
+    const llmResponse = await callGroq(message, systemPrompt);
+    const response = llmResponse || buildFallbackResponse(message, relevantChunks);
+
+    return NextResponse.json({
+      response,
+      usedLLM: llmResponse !== null,
+      sources: relevantChunks.map((c) => c.topic),
+    });
+  } catch (error) {
+    console.error('Chat API error:', error);
+    return NextResponse.json(
+      { error: 'Something went wrong processing your message.' },
+      { status: 500 }
+    );
+  }
+}
+'@ | Set-Content -Path ".\app\api\chat\route.ts" -Encoding utf8
+
+@'
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=llama-3.3-70b-versatile
+'@ | Set-Content -Path ".\.env.local" -Encoding utf8
+
+Write-Host "Created lib\knowledgeBase.ts"
+Write-Host "Created app\api\chat\route.ts"
+Write-Host "Created .env.local (edit it and paste your real Groq key in!)"
+Write-Host ""
+Write-Host "NEXT: open .env.local, paste your real key, then edit app\page.tsx (see instructions in chat)."
+</file>
+
+<file path="app/api/insights/route.ts">
+import { NextResponse } from 'next/server';
+
+// These API routes are placeholders for when you want to add server-side storage
+// Currently, the app uses localStorage for client-side storage
+
+export async function GET() {
+  return NextResponse.json({ message: 'Insights API endpoint - currently using localStorage' });
+}
+</file>
+
+<file path="app/api/journal/route.ts">
+import { NextResponse } from 'next/server';
+
+// These API routes are placeholders for when you want to add server-side storage
+// Currently, the app uses localStorage for client-side storage
+
+export async function GET() {
+  return NextResponse.json({ message: 'Journal API endpoint - currently using localStorage' });
+}
+
+export async function POST(request: Request) {
+  const data = await request.json();
+  // You can add server-side storage logic here later
+  return NextResponse.json({ success: true, data });
+}
+</file>
+
+<file path="app/api/mood/route.ts">
+import { NextResponse } from 'next/server';
+
+// These API routes are placeholders for when you want to add server-side storage
+// Currently, the app uses localStorage for client-side storage
+
+export async function GET() {
+  return NextResponse.json({ message: 'Mood API endpoint - currently using localStorage' });
+}
+
+export async function POST(request: Request) {
+  const data = await request.json();
+  // You can add server-side storage logic here later
+  return NextResponse.json({ success: true, data });
+}
+</file>
+
+<file path="app/components/ChatSection.tsx">
+'use client';
+
+import { useState, useRef, useEffect } from 'react';
+import { Message } from '@/lib/types';
+
+interface ChatSectionProps {
+  messages: Message[];
+  onSendMessage: (content: string) => void;
+}
+
+export default function ChatSection({ messages, onSendMessage }: ChatSectionProps) {
+  const [input, setInput] = useState('');
+  const chatContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  const handleSend = () => {
+    if (input.trim()) {
+      onSendMessage(input);
+      setInput('');
+    }
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  return (
+    <section className="content-section active">
+      <div className="section-header">
+        <h1>Mental Health Companion</h1>
+        <p>A safe space to talk, reflect, and grow</p>
+      </div>
+
+      <div className="chat-container" ref={chatContainerRef}>
+        <div className="message bot-message">
+          <div className="message-content">
+            <p>
+              Hello! I'm here to listen and support you. Feel free to share what's on
+              your mind. Remember, this is a safe space.
+            </p>
+          </div>
+        </div>
+        {messages.map((message) => (
+          <div
+            key={message.id}
+            className={`message ${message.isUser ? 'user-message' : 'bot-message'}`}
+          >
+            <div className="message-content">
+              <p>{message.content}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="chat-input-area">
+        <input
+          type="text"
+          className="chat-input"
+          placeholder="Share your thoughts..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyPress={handleKeyPress}
+          autoComplete="off"
+        />
+        <button className="send-btn" onClick={handleSend}>
+          Send
+        </button>
+      </div>
+    </section>
+  );
+}
+</file>
+
+<file path="app/components/InsightsSection.tsx">
+'use client';
+
+import { useMemo } from 'react';
+import { getInsights } from '@/lib/api';
+import { AppData } from '@/lib/types';
+
+interface InsightsSectionProps {
+  data: AppData;
+}
+
+export default function InsightsSection({ data }: InsightsSectionProps) {
+  const insights = useMemo(() => {
+    return getInsights();
+  }, [data]);
+
+  return (
+    <section className="content-section active">
+      <div className="section-header">
+        <h1>Insights & Patterns</h1>
+        <p>Understand your mental wellness journey</p>
+      </div>
+
+      <div className="insights-grid">
+        <div className="insight-card">
+          <div className="insight-header">
+            <h3>Average Mood</h3>
+          </div>
+          <div className="insight-value">{insights.averageMood}</div>
+          <p className="insight-description">This week</p>
+        </div>
+
+        <div className="insight-card">
+          <div className="insight-header">
+            <h3>Journal Entries</h3>
+          </div>
+          <div className="insight-value">{insights.entryCount}</div>
+          <p className="insight-description">Total written</p>
+        </div>
+
+        <div className="insight-card">
+          <div className="insight-header">
+            <h3>Mood Logs</h3>
+          </div>
+          <div className="insight-value">{insights.moodCount}</div>
+          <p className="insight-description">This week</p>
+        </div>
+
+        <div className="insight-card">
+          <div className="insight-header">
+            <h3>Consistency</h3>
+          </div>
+          <div className="insight-value">{insights.streakDays}</div>
+          <p className="insight-description">Day streak</p>
+        </div>
+      </div>
+
+      <div className="triggers-section">
+        <h2>Common Mood Triggers</h2>
+        <div className="triggers-list">
+          {insights.triggers.length > 0 ? (
+            insights.triggers.map((trigger, index) => (
+              <span key={index} className="trigger-tag">
+                {trigger}
+              </span>
+            ))
+          ) : (
+            <p className="empty-state">Log moods with notes to see patterns</p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+</file>
+
+<file path="app/components/JournalSection.tsx">
+'use client';
+
+import { useState, useMemo } from 'react';
+import { JournalEntry } from '@/lib/types';
+
+interface JournalSectionProps {
+  entries: JournalEntry[];
+  onAddEntry: (entry: Omit<JournalEntry, 'id' | 'timestamp'>) => void;
+}
+
+export default function JournalSection({ entries, onAddEntry }: JournalSectionProps) {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [heading, setHeading] = useState('');
+  const [content, setContent] = useState('');
+  const [selectedMood, setSelectedMood] = useState('');
+  const [filter, setFilter] = useState('');
+
+  const moods = ['😢', '😟', '😐', '🙂', '😊'];
+
+  const filteredEntries = useMemo(() => {
+    if (!filter) return entries;
+
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    return entries.filter((entry) => {
+      const entryDate = new Date(entry.timestamp);
+      const entryDay = new Date(entryDate.getFullYear(), entryDate.getMonth(), entryDate.getDate());
+
+      if (filter === 'today') {
+        return entryDay.getTime() === today.getTime();
+      } else if (filter === 'week') {
+        const weekAgo = new Date(today);
+        weekAgo.setDate(weekAgo.getDate() - 7);
+        return entryDay >= weekAgo;
+      } else if (filter === 'month') {
+        const monthAgo = new Date(today);
+        monthAgo.setMonth(monthAgo.getMonth() - 1);
+        return entryDay >= monthAgo;
+      }
+      return true;
+    });
+  }, [entries, filter]);
+
+  const handleSave = () => {
+    if (heading.trim() && content.trim() && selectedMood) {
+      onAddEntry({
+        heading: heading.trim(),
+        content: content.trim(),
+        mood: selectedMood,
+      });
+      setHeading('');
+      setContent('');
+      setSelectedMood('');
+      setIsModalOpen(false);
+    }
+  };
+
+  const handleCancel = () => {
+    setHeading('');
+    setContent('');
+    setSelectedMood('');
+    setIsModalOpen(false);
+  };
+
+  const formatDate = (date: Date) => {
+    return new Date(date).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+  };
+
+  return (
+    <section className="content-section active">
+      <div className="section-header">
+        <h1>Daily Journal</h1>
+        <p>Reflect and document your feelings</p>
+      </div>
+
+      <div className="journal-controls">
+        <button className="btn btn-primary" onClick={() => setIsModalOpen(true)}>
+          Write New Entry
+        </button>
+        <select
+          className="journal-filter"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        >
+          <option value="">All Entries</option>
+          <option value="today">Today</option>
+          <option value="week">This Week</option>
+          <option value="month">This Month</option>
+        </select>
+      </div>
+
+      <div className="journal-entries">
+        {filteredEntries.length === 0 ? (
+          <p className="empty-state">
+            No journal entries yet. Start by writing your first entry!
+          </p>
+        ) : (
+          filteredEntries
+            .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+            .map((entry) => (
+              <div key={entry.id} className="journal-entry">
+                <div className="entry-meta">
+                  <span>{formatDate(entry.timestamp)}</span>
+                  <span className="entry-mood">{entry.mood}</span>
+                </div>
+                <h3 className="entry-heading">{entry.heading}</h3>
+                <p className="entry-preview">{entry.content}</p>
+              </div>
+            ))
+        )}
+      </div>
+
+      {/* Entry Modal */}
+      <div className={`modal ${isModalOpen ? 'active' : ''}`}>
+        <div className="modal-content">
+          <div className="modal-header">
+            <h2>New Entry</h2>
+            <button className="modal-close" onClick={handleCancel}>
+              ×
+            </button>
+          </div>
+          <div className="modal-body">
+            <input
+              type="text"
+              className="entry-input"
+              placeholder="How are you feeling today?"
+              value={heading}
+              onChange={(e) => setHeading(e.target.value)}
+            />
+            <textarea
+              className="entry-textarea"
+              placeholder="Write your thoughts here..."
+              rows={10}
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+            />
+            <div className="mood-selector">
+              <label>How are you feeling?</label>
+              <div className="mood-options">
+                {moods.map((mood) => (
+                  <button
+                    key={mood}
+                    className={`mood-btn ${selectedMood === mood ? 'selected' : ''}`}
+                    onClick={() => setSelectedMood(mood)}
+                  >
+                    {mood}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="modal-footer">
+            <button className="btn btn-secondary" onClick={handleCancel}>
+              Cancel
+            </button>
+            <button className="btn btn-primary" onClick={handleSave}>
+              Save Entry
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+</file>
+
+<file path="app/components/MoodSection.tsx">
+'use client';
+
+import { useState, useMemo } from 'react';
+import { MoodLog } from '@/lib/types';
+
+interface MoodSectionProps {
+  moodLogs: MoodLog[];
+  onLogMood: (log: Omit<MoodLog, 'id' | 'timestamp'>) => void;
+}
+
+export default function MoodSection({ moodLogs, onLogMood }: MoodSectionProps) {
+  const [selectedMood, setSelectedMood] = useState<number | null>(null);
+  const [note, setNote] = useState('');
+
+  const moods = [
+    { value: 1, label: '😢 Terrible' },
+    { value: 2, label: '😟 Bad' },
+    { value: 3, label: '😐 Okay' },
+    { value: 4, label: '🙂 Good' },
+    { value: 5, label: '😊 Great' },
+  ];
+
+  const weeklyData = useMemo(() => {
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const today = new Date();
+    const weekData: { day: string; value: number; count: number }[] = [];
+
+    for (let i = 6; i >= 0; i--) {
+      const date = new Date(today);
+      date.setDate(date.getDate() - i);
+      const dayStart = new Date(date.setHours(0, 0, 0, 0));
+      const dayEnd = new Date(date.setHours(23, 59, 59, 999));
+
+      const dayLogs = moodLogs.filter((log) => {
+        const logDate = new Date(log.timestamp);
+        return logDate >= dayStart && logDate <= dayEnd;
+      });
+
+      const avgValue =
+        dayLogs.length > 0
+          ? dayLogs.reduce((sum, log) => sum + log.value, 0) / dayLogs.length
+          : 0;
+
+      weekData.push({
+        day: days[date.getDay()],
+        value: avgValue,
+        count: dayLogs.length,
+      });
+    }
+
+    return weekData;
+  }, [moodLogs]);
+
+  const handleLogMood = () => {
+    if (selectedMood !== null) {
+      onLogMood({
+        value: selectedMood,
+        note: note.trim() || undefined,
+      });
+      setSelectedMood(null);
+      setNote('');
+    }
+  };
+
+  return (
+    <section className="content-section active">
+      <div className="section-header">
+        <h1>Mood Tracker</h1>
+        <p>Monitor your emotional wellbeing</p>
+      </div>
+
+      <div className="mood-tracker">
+        <div className="mood-logging">
+          <h2>Log Your Mood</h2>
+          <div className="mood-selector-large">
+            <div>
+              {moods.map((mood) => (
+                <button
+                  key={mood.value}
+                  className={`mood-btn-large ${
+                    selectedMood === mood.value ? 'selected' : ''
+                  }`}
+                  onClick={() => setSelectedMood(mood.value)}
+                >
+                  {mood.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <textarea
+            className="mood-note"
+            placeholder="What triggered this mood? (optional)"
+            rows={4}
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+          />
+          <button className="btn btn-primary" onClick={handleLogMood}>
+            Log Mood
+          </button>
+        </div>
+
+        <div className="mood-chart">
+          <h2>Weekly Mood Pattern</h2>
+          <div className="chart">
+            {weeklyData.length > 0 ? (
+              weeklyData.map((day, index) => (
+                <div
+                  key={index}
+                  className="chart-bar"
+                  style={{
+                    height: day.value > 0 ? `${(day.value / 5) * 100}%` : '20px',
+                  }}
+                  title={`${day.day}: ${day.value.toFixed(1)} (${day.count} logs)`}
+                >
+                  <span className="chart-bar-label">{day.day}</span>
+                </div>
+              ))
+            ) : (
+              <div className="chart-placeholder">Loading your mood data...</div>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+</file>
+
+<file path="app/components/Sidebar.tsx">
+'use client';
+
+import { useMemo, useState, useSyncExternalStore } from 'react';
+import Image from 'next/image';
+import { Check, PanelLeftClose, Plus, Trash2, X } from 'lucide-react';
+import type { Conversation } from '@/lib/types';
+import { APP_NAME } from '@/lib/brand';
+import { groupConversations } from '@/lib/groupConversations';
+
+interface Props {
+  conversations: Conversation[];
+  activeId: string | null;
+  open: boolean;
+  onClose: () => void;
+  onNew: () => void;
+  onSelect: (id: string) => void;
+  onDelete: (id: string) => void;
+}
+
+const noopSubscribe = () => () => {};
+const modifierKey = () => (/Mac|iPhone|iPad/.test(navigator.userAgent) ? '⌘' : 'Ctrl ');
+
+export default function Sidebar({ conversations, activeId, open, onClose, onNew, onSelect, onDelete }: Props) {
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const mod = useSyncExternalStore(noopSubscribe, modifierKey, () => 'Ctrl ');
+  const groups = useMemo(() => groupConversations(conversations), [conversations]);
+
+  return (
+    <>
+      {/* Backdrop — mobile only */}
+      {open && <div className="fixed inset-0 z-30 bg-black/20 md:hidden" onClick={onClose} aria-hidden />}
+
+      <aside
+        className={`fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 select-none flex-col border-r border-line bg-sidebar transition-[transform,margin] duration-200 md:static md:z-auto ${
+          open ? 'translate-x-0' : '-translate-x-full md:translate-x-0 md:-ml-64'
+        }`}
+        aria-label="Conversations"
+      >
+        <div className="flex items-center justify-between p-3.5">
+          <div className="flex items-center gap-2.5 px-1.5 py-1">
+            <Image
+              src="/solvra-logo.png"
+              alt=""
+              width={24}
+              height={24}
+              className="h-6 w-6 shrink-0 rounded-md border border-line-strong object-cover"
+            />
+            <span className="text-[15px] font-medium tracking-tight">{APP_NAME}</span>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            title="Collapse sidebar"
+            aria-label="Collapse sidebar"
+            className="rounded-lg p-1.5 text-[#88837a] transition-colors hover:bg-line hover:text-ink"
+          >
+            <PanelLeftClose size={18} />
+          </button>
+        </div>
+
+        <div className="px-3 pb-2">
+          <button
+            type="button"
+            onClick={onNew}
+            className="group flex w-full items-center justify-between rounded-xl border border-line-strong bg-white px-3 py-2 text-sm font-medium shadow-[0_1px_2px_rgba(0,0,0,0.03)] transition-colors hover:bg-paper"
+          >
+            <span className="flex items-center gap-2">
+              <Plus size={17} className="text-accent" />
+              Start new chat
+            </span>
+            <span className="font-mono text-[11px] text-ink-muted group-hover:text-ink-soft">{mod}K</span>
+          </button>
+        </div>
+
+        <nav className="min-h-0 flex-1 space-y-4 overflow-y-auto px-3 py-2 text-xs">
+          {groups.length === 0 && <p className="px-2.5 py-2 text-ink-muted">No conversations yet.</p>}
+          {groups.map((group) => (
+            <div key={group.label}>
+              <div className="mb-1 px-2 text-[11px] font-medium uppercase tracking-wider text-ink-muted">
+                {group.label}
+              </div>
+              <ul className="space-y-0.5">
+                {group.items.map((c) => {
+                  const active = c.id === activeId;
+                  const confirming = confirmId === c.id;
+                  return (
+                    <li key={c.id} className="group/item relative">
+                      <button
+                        type="button"
+                        onClick={() => onSelect(c.id)}
+                        className={`block w-full truncate rounded-lg px-2.5 py-1.5 pr-14 text-left transition-colors ${
+                          active
+                            ? 'bg-[#efece5] font-medium text-ink'
+                            : 'text-ink-soft hover:bg-hover-strong hover:text-ink'
+                        }`}
+                      >
+                        {c.title || 'Untitled'}
+                      </button>
+                      <div
+                        className={`absolute right-1 top-1/2 flex -translate-y-1/2 items-center ${
+                          confirming ? '' : 'opacity-0 group-hover/item:opacity-100 focus-within:opacity-100'
+                        }`}
+                      >
+                        {confirming ? (
+                          <>
+                            <button
+                              type="button"
+                              title="Confirm delete"
+                              aria-label="Confirm delete"
+                              onClick={() => {
+                                setConfirmId(null);
+                                onDelete(c.id);
+                              }}
+                              className="rounded p-1 text-[#a64731] hover:bg-accent-tint"
+                            >
+                              <Check size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              title="Cancel"
+                              aria-label="Cancel delete"
+                              onClick={() => setConfirmId(null)}
+                              className="rounded p-1 text-ink-soft hover:bg-line"
+                            >
+                              <X size={14} />
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            title="Delete chat"
+                            aria-label={`Delete ${c.title}`}
+                            onClick={() => setConfirmId(c.id)}
+                            className="rounded p-1 text-ink-muted hover:bg-line hover:text-[#a64731]"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))}
+        </nav>
+
+        <div className="border-t border-line bg-[#f3f0ea] px-4 py-3 font-mono text-[11px] text-ink-muted">
+          Stored in this browser only.
+        </div>
+      </aside>
+    </>
+  );
+}
+</file>
+
+<file path="hooks/useAppData.ts">
+import { useState, useEffect } from 'react';
+import { AppData, Message, JournalEntry, MoodLog } from '@/lib/types';
+import { getStoredData, addMessage, addJournalEntry, addMoodLog } from '@/lib/api';
+
+export const useAppData = () => {
+  const [data, setData] = useState<AppData>({ messages: [], journalEntries: [], moodLogs: [] });
+  const [isLoaded, setIsLoaded] = useState(false);
+
+  useEffect(() => {
+    const loadedData = getStoredData();
+    setData(loadedData);
+    setIsLoaded(true);
+  }, []);
+
+  const addNewMessage = (message: Message) => {
+    const newData = addMessage(message);
+    setData(newData);
+  };
+
+  const addNewJournalEntry = (entry: JournalEntry) => {
+    const newData = addJournalEntry(entry);
+    setData(newData);
+  };
+
+  const addNewMoodLog = (log: MoodLog) => {
+    const newData = addMoodLog(log);
+    setData(newData);
+  };
+
+  const clearMessages = () => {
+    const newData = { ...data, messages: [] };
+    setData(newData);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('safespace_data', JSON.stringify(newData));
+    }
+  };
+
+  return {
+    data,
+    isLoaded,
+    addNewMessage,
+    addNewJournalEntry,
+    addNewMoodLog,
+    clearMessages,
+  };
+};
+</file>
+
+<file path="lib/api.ts">
+import { AppData, JournalEntry, MoodLog, Message, InsightData } from './types';
+
+const STORAGE_KEY = 'safespace_data';
+
+export const getStoredData = (): AppData => {
+  if (typeof window === 'undefined') {
+    return { messages: [], journalEntries: [], moodLogs: [] };
+  }
+  
+  const stored = localStorage.getItem(STORAGE_KEY);
+  if (!stored) {
+    return { messages: [], journalEntries: [], moodLogs: [] };
+  }
+  
+  const data = JSON.parse(stored);
+  // Convert string dates back to Date objects
+  return {
+    messages: data.messages.map((m: any) => ({ ...m, timestamp: new Date(m.timestamp) })),
+    journalEntries: data.journalEntries.map((e: any) => ({ ...e, timestamp: new Date(e.timestamp) })),
+    moodLogs: data.moodLogs.map((l: any) => ({ ...l, timestamp: new Date(l.timestamp) })),
+  };
+};
+
+export const saveData = (data: AppData): void => {
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  }
+};
+
+export const addMessage = (message: Message): AppData => {
+  const data = getStoredData();
+  data.messages.push(message);
+  saveData(data);
+  return data;
+};
+
+export const addJournalEntry = (entry: JournalEntry): AppData => {
+  const data = getStoredData();
+  data.journalEntries.push(entry);
+  saveData(data);
+  return data;
+};
+
+export const addMoodLog = (log: MoodLog): AppData => {
+  const data = getStoredData();
+  data.moodLogs.push(log);
+  saveData(data);
+  return data;
+};
+
+export const getInsights = (): InsightData => {
+  const data = getStoredData();
+  
+  // Calculate average mood for this week
+  const oneWeekAgo = new Date();
+  oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+  
+  const weekMoods = data.moodLogs.filter(log => log.timestamp >= oneWeekAgo);
+  const averageMood = weekMoods.length > 0
+    ? (weekMoods.reduce((sum, log) => sum + log.value, 0) / weekMoods.length).toFixed(1)
+    : '—';
+  
+  // Extract triggers from mood notes
+  const triggers: { [key: string]: number } = {};
+  data.moodLogs.forEach(log => {
+    if (log.note) {
+      const words = log.note.toLowerCase().split(/\s+/);
+      words.forEach(word => {
+        if (word.length > 3) {
+          triggers[word] = (triggers[word] || 0) + 1;
+        }
+      });
+    }
+  });
+  
+  const topTriggers = Object.entries(triggers)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([word]) => word);
+  
+  // Calculate streak (simplified)
+  const sortedLogs = [...data.moodLogs].sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+  let streak = 0;
+  if (sortedLogs.length > 0) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    for (let i = 0; i < sortedLogs.length; i++) {
+      const logDate = new Date(sortedLogs[i].timestamp);
+      logDate.setHours(0, 0, 0, 0);
+      
+      const daysDiff = Math.floor((today.getTime() - logDate.getTime()) / (1000 * 60 * 60 * 24));
+      
+      if (daysDiff === i) {
+        streak++;
+      } else {
+        break;
+      }
+    }
+  }
+  
+  return {
+    averageMood,
+    entryCount: data.journalEntries.length,
+    moodCount: weekMoods.length,
+    streakDays: streak,
+    triggers: topTriggers,
+  };
+};
+</file>
+
+<file path="lib/types.ts">
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  /** Set when the assistant turn failed; excluded from the history sent to the API. */
+  error?: boolean;
+}
+
+export interface Conversation {
+  id: string;
+  title: string; // first 40 chars of the first user message
+  messages: ChatMessage[];
+  createdAt: number;
+}
+</file>
+
+<file path="public/file.svg">
+<svg fill="none" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M14.5 13.5V5.41a1 1 0 0 0-.3-.7L9.8.29A1 1 0 0 0 9.08 0H1.5v13.5A2.5 2.5 0 0 0 4 16h8a2.5 2.5 0 0 0 2.5-2.5m-1.5 0v-7H8v-5H3v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1M9.5 5V2.12L12.38 5zM5.13 5h-.62v1.25h2.12V5zm-.62 3h7.12v1.25H4.5zm.62 3h-.62v1.25h7.12V11z" clip-rule="evenodd" fill="#666" fill-rule="evenodd"/></svg>
+</file>
+
+<file path="public/globe.svg">
+<svg fill="none" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g clip-path="url(#a)"><path fill-rule="evenodd" clip-rule="evenodd" d="M10.27 14.1a6.5 6.5 0 0 0 3.67-3.45q-1.24.21-2.7.34-.31 1.83-.97 3.1M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16m.48-1.52a7 7 0 0 1-.96 0H7.5a4 4 0 0 1-.84-1.32q-.38-.89-.63-2.08a40 40 0 0 0 3.92 0q-.25 1.2-.63 2.08a4 4 0 0 1-.84 1.31zm2.94-4.76q1.66-.15 2.95-.43a7 7 0 0 0 0-2.58q-1.3-.27-2.95-.43a18 18 0 0 1 0 3.44m-1.27-3.54a17 17 0 0 1 0 3.64 39 39 0 0 1-4.3 0 17 17 0 0 1 0-3.64 39 39 0 0 1 4.3 0m1.1-1.17q1.45.13 2.69.34a6.5 6.5 0 0 0-3.67-3.44q.65 1.26.98 3.1M8.48 1.5l.01.02q.41.37.84 1.31.38.89.63 2.08a40 40 0 0 0-3.92 0q.25-1.2.63-2.08a4 4 0 0 1 .85-1.32 7 7 0 0 1 .96 0m-2.75.4a6.5 6.5 0 0 0-3.67 3.44 29 29 0 0 1 2.7-.34q.31-1.83.97-3.1M4.58 6.28q-1.66.16-2.95.43a7 7 0 0 0 0 2.58q1.3.27 2.95.43a18 18 0 0 1 0-3.44m.17 4.71q-1.45-.12-2.69-.34a6.5 6.5 0 0 0 3.67 3.44q-.65-1.27-.98-3.1" fill="#666"/></g><defs><clipPath id="a"><path fill="#fff" d="M0 0h16v16H0z"/></clipPath></defs></svg>
+</file>
+
+<file path="public/next.svg">
+<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 394 80"><path fill="#000" d="M262 0h68.5v12.7h-27.2v66.6h-13.6V12.7H262V0ZM149 0v12.7H94v20.4h44.3v12.6H94v21h55v12.6H80.5V0h68.7zm34.3 0h-17.8l63.8 79.4h17.9l-32-39.7 32-39.6h-17.9l-23 28.6-23-28.6zm18.3 56.7-9-11-27.1 33.7h17.8l18.3-22.7z"/><path fill="#000" d="M81 79.3 17 0H0v79.3h13.6V17l50.2 62.3H81Zm252.6-.4c-1 0-1.8-.4-2.5-1s-1.1-1.6-1.1-2.6.3-1.8 1-2.5 1.6-1 2.6-1 1.8.3 2.5 1a3.4 3.4 0 0 1 .6 4.3 3.7 3.7 0 0 1-3 1.8zm23.2-33.5h6v23.3c0 2.1-.4 4-1.3 5.5a9.1 9.1 0 0 1-3.8 3.5c-1.6.8-3.5 1.3-5.7 1.3-2 0-3.7-.4-5.3-1s-2.8-1.8-3.7-3.2c-.9-1.3-1.4-3-1.4-5h6c.1.8.3 1.6.7 2.2s1 1.2 1.6 1.5c.7.4 1.5.5 2.4.5 1 0 1.8-.2 2.4-.6a4 4 0 0 0 1.6-1.8c.3-.8.5-1.8.5-3V45.5zm30.9 9.1a4.4 4.4 0 0 0-2-3.3 7.5 7.5 0 0 0-4.3-1.1c-1.3 0-2.4.2-3.3.5-.9.4-1.6 1-2 1.6a3.5 3.5 0 0 0-.3 4c.3.5.7.9 1.3 1.2l1.8 1 2 .5 3.2.8c1.3.3 2.5.7 3.7 1.2a13 13 0 0 1 3.2 1.8 8.1 8.1 0 0 1 3 6.5c0 2-.5 3.7-1.5 5.1a10 10 0 0 1-4.4 3.5c-1.8.8-4.1 1.2-6.8 1.2-2.6 0-4.9-.4-6.8-1.2-2-.8-3.4-2-4.5-3.5a10 10 0 0 1-1.7-5.6h6a5 5 0 0 0 3.5 4.6c1 .4 2.2.6 3.4.6 1.3 0 2.5-.2 3.5-.6 1-.4 1.8-1 2.4-1.7a4 4 0 0 0 .8-2.4c0-.9-.2-1.6-.7-2.2a11 11 0 0 0-2.1-1.4l-3.2-1-3.8-1c-2.8-.7-5-1.7-6.6-3.2a7.2 7.2 0 0 1-2.4-5.7 8 8 0 0 1 1.7-5 10 10 0 0 1 4.3-3.5c2-.8 4-1.2 6.4-1.2 2.3 0 4.4.4 6.2 1.2 1.8.8 3.2 2 4.3 3.4 1 1.4 1.5 3 1.5 5h-5.8z"/></svg>
+</file>
+
+<file path="public/vercel.svg">
+<svg fill="none" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1155 1000"><path d="m577.3 0 577.4 1000H0z" fill="#fff"/></svg>
+</file>
+
+<file path="public/window.svg">
+<svg fill="none" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill-rule="evenodd" clip-rule="evenodd" d="M1.5 2.5h13v10a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1zM0 1h16v11.5a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 0 12.5zm3.75 4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5M7 4.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0m1.75.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5" fill="#666"/></svg>
+</file>
+
+<file path=".gitignore">
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+</file>
+
+<file path="eslint.config.mjs">
+import { defineConfig, globalIgnores } from "eslint/config";
+import nextVitals from "eslint-config-next/core-web-vitals";
+import nextTs from "eslint-config-next/typescript";
+
+const eslintConfig = defineConfig([
+  ...nextVitals,
+  ...nextTs,
+  // Override default ignores of eslint-config-next.
+  globalIgnores([
+    // Default ignores of eslint-config-next:
+    ".next/**",
+    "out/**",
+    "build/**",
+    "next-env.d.ts",
+  ]),
+]);
+
+export default eslintConfig;
+</file>
+
+<file path="next.config.ts">
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  /* config options here */
+};
+
+export default nextConfig;
+</file>
+
+<file path="package.json">
+{
+  "name": "safespace_ai",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "next": "16.0.2",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "baseline-browser-mapping": "^2.11.25",
+    "eslint": "^9",
+    "eslint-config-next": "16.0.2",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
+</file>
+
+<file path="postcss.config.mjs">
+const config = {
+  plugins: {
+    "@tailwindcss/postcss": {},
+  },
+};
+
+export default config;
+</file>
+
+<file path="tailwind.config.js">
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  darkMode: 'class',
+  content: ['./app/**/*.{js,ts,jsx,tsx}', './components/**/*.{js,ts,jsx,tsx}'],
+  theme: {
+    extend: {
+      colors: {
+        primary: 'var(--primary)',
+        'primary-light': 'var(--primary-light)',
+        accent: 'var(--accent)',
+        'accent-light': 'var(--accent-light)',
+        bg: {
+          primary: 'var(--bg-primary)',
+          secondary: 'var(--bg-secondary)',
+          tertiary: 'var(--bg-tertiary)',
+        },
+        text: {
+          primary: 'var(--text-primary)',
+          secondary: 'var(--text-secondary)',
+          light: 'var(--text-light)',
+        },
+        border: 'var(--border)',
+      },
+      borderRadius: {
+        DEFAULT: 'var(--radius)',
+      },
+      boxShadow: {
+        card: '0 4px 12px var(--shadow)',
+      },
+    },
+  },
+  plugins: [],
+};
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts",
+    "**/*.mts"
+  ],
+  "exclude": ["node_modules"]
+}
+</file>
+
+<file path="app/globals.css">
+@import "tailwindcss";
+
+/* ── Solvra design tokens (warm paper / terracotta) ─────────────────────── */
+@theme {
+  --color-paper: #faf9f5;
+  --color-sidebar: #f5f3ed;
+  --color-card: #ffffff;
+  --color-line: #eae7e1;
+  --color-line-strong: #ddd9d0;
+  --color-hover: #efece5;
+  --color-hover-strong: #ece8e0;
+  --color-ink: #262420;
+  --color-ink-soft: #6b665e;
+  --color-ink-muted: #9e998e;
+  --color-accent: #cc6343;
+  --color-accent-hover: #ba5637;
+  --color-accent-tint: #fbf0ec;
+  --color-brand: #205493;
+  --color-code: #211e1c;
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: "Newsreader Variable", Georgia, serif;
+  --font-display: "Instrument Serif", Georgia, serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --animate-dot: dot 1.2s ease-in-out infinite;
+  @keyframes dot {
+    0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+    40% { opacity: 1; transform: translateY(-2px); }
+  }
+}
+
+:root { color-scheme: light; }
+
+html, body { height: 100%; }
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: #f3e3db; color: #5b291a; }
+
+/* Quiet scrollbars */
+* { scrollbar-width: thin; scrollbar-color: #ddd8ce transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #ddd8ce; border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: #c4beb2; }
+
+/* ── Assistant markdown ─────────────────────────────────────────────────── */
+.md { font-size: 15px; line-height: 1.7; color: var(--color-ink); overflow-wrap: anywhere; }
+.md > * + * { margin-top: 0.9em; }
+.md h1, .md h2 { font-family: var(--font-display); font-weight: 400; line-height: 1.2; color: #1a1917; }
+.md h1 { font-size: 1.75rem; margin-top: 1.4em; }
+.md h2 { font-size: 1.4rem; margin-top: 1.3em; }
+.md h3 { font-size: 0.95rem; font-weight: 600; margin-top: 1.2em; }
+.md h4, .md h5, .md h6 { font-size: 0.75rem; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-ink-soft); font-weight: 600; margin-top: 1.2em; }
+.md ul, .md ol { padding-left: 1.4rem; }
+.md ul { list-style: disc; }
+.md ol { list-style: decimal; }
+.md li + li { margin-top: 0.3em; }
+.md li::marker { color: var(--color-ink-muted); }
+.md a { color: var(--color-accent-hover); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: #e6bcae; }
+.md a:hover { text-decoration-color: currentColor; }
+.md strong { font-weight: 600; }
+.md hr { border: 0; border-top: 1px solid var(--color-line); margin: 1.5em 0; }
+.md blockquote { border-left: 2px solid var(--color-accent); padding: 0.1rem 0 0.1rem 1rem; font-family: var(--font-serif); font-style: italic; font-size: 1.05rem; color: #423e37; }
+.md :not(pre) > code { font-family: var(--font-mono); font-size: 0.85em; background: var(--color-hover); border: 1px solid var(--color-line); border-radius: 6px; padding: 0.1em 0.35em; }
+.md table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.md th { text-align: left; font-weight: 500; color: #7c766c; background: var(--color-paper); }
+.md th, .md td { padding: 0.5rem 0.85rem; border-bottom: 1px solid var(--color-line); vertical-align: top; }
+.md tr:last-child td { border-bottom: 0; }
+</file>
+
+<file path="app/layout.tsx">
+import type { Metadata } from 'next';
+import '@fontsource-variable/inter';
+import '@fontsource-variable/newsreader';
+import '@fontsource-variable/newsreader/wght-italic.css';
+import '@fontsource/instrument-serif';
+import '@fontsource-variable/jetbrains-mono';
+import { APP_NAME } from '@/lib/brand';
+import './globals.css';
+
+export const metadata: Metadata = {
+  title: APP_NAME,
+  description: 'A calm, general-purpose AI assistant.',
+};
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en" className="h-full">
+      <body className="h-full overflow-hidden text-[15px] antialiased">{children}</body>
+    </html>
+  );
+}
+</file>
+
+<file path="app/page.tsx">
+'use client';
+
+import { useSyncExternalStore } from 'react';
+import ChatApp from './components/ChatApp';
+
+const subscribe = () => () => {};
+
+export default function Home() {
+  // ChatApp reads localStorage on first render, so only mount it in the browser.
+  const isClient = useSyncExternalStore(subscribe, () => true, () => false);
+  return isClient ? <ChatApp /> : <div className="h-full bg-paper" />;
+}
+</file>
+
+<file path="README.md">
+# Solvra redesign — drop-in overlay
+
+Design implemented: `claude_inspired_minimalist_ai_workspace` (warm paper + terracotta).
+Behaviour, API contract (`/api/chat`), data model and the `chatbot_conversations`
+localStorage key are unchanged — existing chats keep working.
+
+## Apply
+
+1. Copy these folders over your project root (merge; `app/page.tsx` is replaced):
+   `app/`  `lib/`  `public/`
+   Do NOT touch `app/api/chat/route.ts` or `.env.local`.
+
+2. Install dependencies (fonts are self-hosted, so no Google Fonts / offline build issues):
+
+   npm i react-markdown remark-gfm lucide-react \
+     @fontsource-variable/inter @fontsource-variable/newsreader \
+     @fontsource/instrument-serif @fontsource-variable/jetbrains-mono
+
+3. `npm run dev`
+
+## Notes
+- Product name lives in `lib/brand.ts` (`APP_NAME`). The design mock says "Sovra",
+  your logo file is `solvra.jpg` — set whichever is correct.
+- `page.tsx` is now a thin client-only shell; all state/streaming logic is in
+  `app/components/ChatApp.tsx`.
+- `ChatMessage` gained an optional `error?: boolean` (failed turns are shown in
+  the chat but never sent back to the model).
+</file>
+
+</files>

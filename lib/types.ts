@@ -1,37 +1,14 @@
-export type Section = 'chat' | 'journal' | 'mood' | 'insights';
-
-export interface Message {
+export interface ChatMessage {
   id: string;
+  role: 'user' | 'assistant';
   content: string;
-  isUser: boolean;
-  timestamp: Date;
+  /** Set when the assistant turn failed; excluded from the history sent to the API. */
+  error?: boolean;
 }
 
-export interface JournalEntry {
+export interface Conversation {
   id: string;
-  heading: string;
-  content: string;
-  mood: string;
-  timestamp: Date;
-}
-
-export interface MoodLog {
-  id: string;
-  value: number;
-  note?: string;
-  timestamp: Date;
-}
-
-export interface AppData {
-  messages: Message[];
-  journalEntries: JournalEntry[];
-  moodLogs: MoodLog[];
-}
-
-export interface InsightData {
-  averageMood: string;
-  entryCount: number;
-  moodCount: number;
-  streakDays: number;
-  triggers: string[];
+  title: string; // first 40 chars of the first user message
+  messages: ChatMessage[];
+  createdAt: number;
 }
